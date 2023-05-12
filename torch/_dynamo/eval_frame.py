@@ -24,10 +24,10 @@ import torch.fx
 import torch.utils._pytree as pytree
 import torch.utils.checkpoint
 from torch import _guards
+from torch._subclasses import fake_tensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
 from torch.nn.parallel.distributed import DistributedDataParallel
-
 from ..fx import GraphModule
 from .backends.registry import CompilerFn, lookup_backend
 
@@ -799,6 +799,7 @@ def export(
     constraints: Optional[List[Constraint]] = None,
     assume_static_by_default: bool = False,
     functionalize: bool = False,
+    fake_mode: fake_tensor.FakeTensorMode = None,
     **kwargs,
 ) -> Tuple[torch.fx.GraphModule, Set[_guards.Guard]]:
     """
@@ -825,6 +826,8 @@ def export(
 
         functionalize (bool): If True, the resulting aten graph module will be functional. You will need to
         set aten_graph=True to see the effect. By default, this flag will be false.
+
+        fake_mode (fake_tensor.FakeTensorMode): Use this fake_mode instead of creating an internal one.
 
         **kwargs: Arbitrary keyword arguments to be passed to the function f.
 
@@ -898,7 +901,6 @@ def export(
         assert out_guards is None, "whole graph export entails exactly one guard export"
         out_guards = guards
 
-    fake_mode = None
     example_inputs = []
 
     def dynamo_normalization_capturing_compiler(
@@ -911,7 +913,7 @@ def export(
         graph = gm
 
         nonlocal fake_mode, example_inputs
-        fake_mode = _guards.detect_fake_mode(inner_example_inputs)
+        fake_mode = fake_mode or _guards.detect_fake_mode(inner_example_inputs)
         example_inputs = inner_example_inputs
 
         def result_capturing_wrapper(*graph_inputs):
@@ -943,6 +945,7 @@ def export(
             export=True,
             export_constraints=constraints,
             dynamic=(tracing_mode == "symbolic"),
+            fake_mode=fake_mode,
         )(f)
         # TODO(voz): We may have instances of `f` that mutate inputs, we should track sideffects and reject.
         try:
@@ -1163,6 +1166,7 @@ def optimize_assert(
     export=False,
     export_constraints=None,
     dynamic=False,
+    fake_mode: fake_tensor.FakeTensorMode = None,
 ):
     """
     The same as `torch._dynamo.optimize(backend, nopython=True)`
@@ -1174,7 +1178,10 @@ def optimize_assert(
 
     return _optimize_catch_errors(
         convert_frame.convert_frame_assert(
-            backend, export=export, export_constraints=export_constraints
+            backend,
+            export=export,
+            export_constraints=export_constraints,
+            fake_mode=fake_mode,
         ),
         hooks,
         backend_ctx_ctor,
