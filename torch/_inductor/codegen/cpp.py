@@ -1142,12 +1142,11 @@ class CppKernel(Kernel):
             raise NotImplementedError(f"store mode={mode}")
         self.stores.writeline(DeferredLine(name, line))
 
-    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+    def reduction(self, dtype, src_dtype, reduction_type, value):
         argmax_or_argmin = reduction_type in {"argmax", "argmin"}
         acc = self.reduction_cse.generate(
             self.loads, f"reduction {name} {cexpr_index(index)}", write=False
         )
-        index = self.rename_indexing(index)
         self.reduction_var_map[acc] = reduction_type
         if argmax_or_argmin:
             self.reduction_prefix.writelines(
@@ -1161,6 +1160,7 @@ class CppKernel(Kernel):
                     "}",
                 ],
             )
+            return f"{tmpvar}.index"
         else:
             acc_type = reduction_acc_type(reduction_type, dtype)
             self.reduction_prefix.writeline(
@@ -1174,12 +1174,14 @@ class CppKernel(Kernel):
             self.reduction_suffix, f"{reduction_project(reduction_type, acc)}"
         )
 
+    def store_reduction(self, name, index, value):
+        index = self.rename_indexing(index)
         if name not in V.graph.removed_buffers:
             var = self.args.output(name)
             self.reduction_suffix.writeline(
-                DeferredLine(name, f"{var}[{cexpr_index(index)}] = {tmpvar};")
+                DeferredLine(name, f"{var}[{cexpr_index(index)}] = {value};")
             )
-        self.cse.store_cache[name] = tmpvar
+        self.cse.store_cache[name] = value
 
     def set_ranges(self, lengths, reduction_lengths):
         if self.call_ranges:
@@ -1445,7 +1447,7 @@ class CppVecKernel(CppKernel):
             )
         self.stores.writeline(DeferredLine(name, line))
 
-    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+    def reduction(self, dtype, src_dtype, reduction_type, value):
         assert reduction_type in {
             "max",
             "min",
@@ -1488,7 +1490,6 @@ initializer(omp_priv={{{reduction_init_vec(reduction_type, dtype)}}})
         )
         acc_vec = f"{acc}_vec"
 
-        index = self.rename_indexing(index)
         self.reduction_var_map[acc_vec] = reduction_type
         self.reduction_prefix.writeline(
             f"{acc_type} {acc} = {reduction_init(reduction_type, dtype)};"
@@ -1524,20 +1525,23 @@ initializer(omp_priv={{{reduction_init_vec(reduction_type, dtype)}}})
                 self.reduction_suffix, reduction_project(reduction_type, acc_vec)
             )
 
+        return reduction_project(reduction_type, tmpvar)
+
+    def store_reduction(self, name, index, value):
         if name not in V.graph.removed_buffers:
             var = self.args.output(name)
             if self.tiling_idx >= self.reduction_depth:
                 # Horizontal reduction
                 self.reduction_suffix.writeline(
-                    DeferredLine(name, f"{var}[{cexpr_index(index)}] = {tmpvar};")
+                    DeferredLine(name, f"{var}[{cexpr_index(index)}] = {value};")
                 )
             else:
                 # Vertical reduction
                 self.reduction_suffix.writeline(
-                    DeferredLine(name, f"{tmpvar}.store({var} + {cexpr_index(index)});")
+                    DeferredLine(name, f"{value}.store({var} + {cexpr_index(index)});")
                 )
 
-        self.cse.store_cache[name] = tmpvar
+        self.cse.store_cache[name] = value
 
 
 class CppTile2DKernel(CppVecKernel):
@@ -1923,7 +1927,7 @@ class CppVecKernelChecker(CppVecKernel):
                 self.disable_vec(f"not a loop: {index}")
             return self.simd_vec
 
-    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+    def reduction(self, dtype, src_dtype, reduction_type, value):
         if (
             dtype == torch.float
             and src_dtype == torch.float
@@ -1934,6 +1938,9 @@ class CppVecKernelChecker(CppVecKernel):
             self.disable_vec(
                 f"reduction: dtype {dtype}, src_dtype {src_dtype}, reduction_type {reduction_type}"
             )
+        return self.simd_vec
+
+    def store_reduction(self, name, index, value):
         return self.simd_vec
 
     def is_supported_cmp(self, node: torch.fx.Node):
@@ -2009,10 +2016,12 @@ class CppVecKernelChecker(CppVecKernel):
                 return self.store(name, index, value, mode=mode)
 
             @staticmethod
-            def reduction(name, dtype, src_dtype, reduction_type, index, value):
-                return self.reduction(
-                    name, dtype, src_dtype, reduction_type, index, value
-                )
+            def reduction(dtype, src_dtype, reduction_type, value):
+                return self.reduction(dtype, src_dtype, reduction_type, value)
+
+            @staticmethod
+            def store_reduction(name, index, value):
+                return self.store_reduction(name, index, value)
 
             @staticmethod
             def constant(val, dtype):
@@ -2330,11 +2339,9 @@ class CppKernelProxy(CppKernel):
                 elif _node.target == "reduction":
                     (
                         ops,
-                        name,
                         dtype,
                         src_dtype,
                         reduction_type,
-                        index,
                         value,
                     ) = _node.args
                     if src_dtype == torch.bfloat16:
@@ -2346,11 +2353,9 @@ class CppKernelProxy(CppKernel):
                         assert dtype in [torch.float, torch.bfloat16, torch.int64]
                         _node.args = (
                             ops,
-                            name,
                             torch.float if dtype == torch.bfloat16 else dtype,
                             torch.float,
                             reduction_type,
-                            index,
                             value,
                         )
                 elif _node.target == "to_dtype" and _node.args[-1] in [torch.bfloat16]:
