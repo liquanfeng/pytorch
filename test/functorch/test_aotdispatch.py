@@ -2705,7 +2705,7 @@ class TestAOTModuleSimplified(AOTTestCase):
                 return (x + fake_z, )
 
         with self.assertRaisesRegex(
-            TypeError, "FakeTensor"
+            AssertionError, "Unexpected fake buffer"
         ):
             aot_module_simplified(MockModule(), (fake_x,), nop)
 
